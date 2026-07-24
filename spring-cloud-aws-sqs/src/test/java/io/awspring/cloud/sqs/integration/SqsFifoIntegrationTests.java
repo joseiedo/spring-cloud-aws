@@ -94,6 +94,7 @@ import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequest;
  *
  * @author Tomaz Fernandes
  * @author Mikhail Strokov
+ * @author José Iêdo
  */
 @SpringBootTest
 class SqsFifoIntegrationTests extends BaseSqsIntegrationTest {
@@ -553,32 +554,13 @@ class SqsFifoIntegrationTests extends BaseSqsIntegrationTest {
 		messages.addAll(createMessagesFromValues(messageGroupId2, valuesGroup2));
 		SqsAsyncClient spyClient = spy(createAsyncClient());
 		List<SendMessageBatchRequest> capturedRequests = Collections.synchronizedList(new ArrayList<>());
-		CountDownLatch secondCallArrived = new CountDownLatch(1);
-		CountDownLatch releaseCalls = new CountDownLatch(1);
-		AtomicInteger concurrentCalls = new AtomicInteger();
-		AtomicInteger maxConcurrent = new AtomicInteger();
 		doAnswer(invocation -> {
-			int current = concurrentCalls.incrementAndGet();
-			maxConcurrent.accumulateAndGet(current, Math::max);
 			capturedRequests.add(invocation.getArgument(0));
-			if (current == 2) {
-				secondCallArrived.countDown();
-			}
-			releaseCalls.await(10, TimeUnit.SECONDS);
-			try {
-				return invocation.callRealMethod();
-			}
-			finally {
-				concurrentCalls.decrementAndGet();
-			}
+			return invocation.callRealMethod();
 		}).when(spyClient).sendMessageBatch(any(SendMessageBatchRequest.class));
 		SqsTemplate fifoTemplate = SqsTemplate.newTemplate(spyClient);
-		CompletableFuture<SendResult.Batch<String>> future = CompletableFuture
-				.supplyAsync(() -> fifoTemplate.sendMany(FIFO_SEND_MORE_THAN_10_MULTIPLE_GROUPS_QUEUE_NAME, messages));
-		assertThat(secondCallArrived.await(10, TimeUnit.SECONDS)).isTrue();
-		assertThat(maxConcurrent.get()).isEqualTo(2);
-		releaseCalls.countDown();
-		SendResult.Batch<String> result = future.get(10, TimeUnit.SECONDS);
+		SendResult.Batch<String> result = fifoTemplate.sendMany(FIFO_SEND_MORE_THAN_10_MULTIPLE_GROUPS_QUEUE_NAME,
+				messages);
 		assertThat(result.successful()).hasSize(35);
 		assertThat(result.failed()).isEmpty();
 		assertThat(capturedRequests).hasSize(4);

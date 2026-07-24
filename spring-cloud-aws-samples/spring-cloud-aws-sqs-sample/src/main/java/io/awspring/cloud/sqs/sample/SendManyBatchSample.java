@@ -32,6 +32,8 @@ import org.springframework.messaging.support.MessageBuilder;
  * Sample demonstrating {@link SqsTemplate#sendMany} sending more than 10 messages at once. The template automatically
  * partitions the messages into batches of 10 and sends them in parallel (for standard queues) or sequentially per
  * message group (for FIFO queues).
+ *
+ * @author José Iêdo
  */
 @Configuration
 public class SendManyBatchSample {

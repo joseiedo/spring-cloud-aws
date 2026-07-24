@@ -84,6 +84,7 @@ import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
  * @author Zhong Xi Lu
  * @author Hyunggeol Lee
  * @author Jeongmin Kim
+ * @author José Iêdo
  *
  * @since 3.0
  */
@@ -402,8 +403,8 @@ public class SqsTemplate extends AbstractMessagingTemplate<Message> implements S
 			return groupId != null ? groupId : "";
 		}));
 		List<CompletableFuture<SendResult.Batch<T>>> groupFutures = groupedByMessageGroup.values().stream()
-				.map(groupMessages -> CompletableFuture
-						.supplyAsync(() -> sendSequentialBatches(endpointName, groupMessages, originalMessagesById))
+				.map(msgs -> CompletableFuture
+						.supplyAsync(() -> sendSequentialBatches(endpointName, msgs, originalMessagesById))
 						.thenCompose(Function.identity()))
 				.toList();
 		return combineBatchFutures(groupFutures);
