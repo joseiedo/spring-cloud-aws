@@ -16,6 +16,7 @@
 package io.awspring.cloud.sqs.operations;
 
 import io.awspring.cloud.core.support.JacksonPresent;
+import io.awspring.cloud.sqs.CollectionUtils;
 import io.awspring.cloud.sqs.FifoUtils;
 import io.awspring.cloud.sqs.MessageHeaderUtils;
 import io.awspring.cloud.sqs.QueueAttributesResolver;
@@ -35,9 +36,11 @@ import io.awspring.cloud.sqs.support.converter.SqsMessagingMessageConverter;
 import io.awspring.cloud.sqs.support.converter.legacy.LegacyJackson2SqsMessagingMessageConverter;
 import io.awspring.cloud.sqs.support.observation.SqsTemplateObservation;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -369,9 +372,64 @@ public class SqsTemplate extends AbstractMessagingTemplate<Message> implements S
 	protected <T> CompletableFuture<SendResult.Batch<T>> doSendBatchAsync(String endpointName,
 			Collection<Message> messages, Collection<org.springframework.messaging.Message<T>> originalMessages) {
 		logger.debug("Sending messages {} to endpoint {}", messages, endpointName);
+		Map<String, org.springframework.messaging.Message<T>> originalMessagesById = originalMessages.stream()
+				.collect(Collectors.toMap(MessageHeaderUtils::getRawMessageId, msg -> msg));
+		if (messages.size() <= 10) {
+			return sendSingleBatch(endpointName, messages, originalMessagesById);
+		}
+		return FifoUtils.isFifo(endpointName) ? sendFifoBatches(endpointName, messages, originalMessagesById)
+				: sendStandardBatches(endpointName, messages, originalMessagesById);
+	}
+
+	private <T> CompletableFuture<SendResult.Batch<T>> sendSingleBatch(String endpointName,
+			Collection<Message> messages, Map<String, org.springframework.messaging.Message<T>> originalMessagesById) {
 		return createSendMessageBatchRequest(endpointName, messages).thenCompose(this.sqsAsyncClient::sendMessageBatch)
-				.thenApply(response -> createSendResultBatch(response, endpointName, originalMessages.stream()
-						.collect(Collectors.toMap(MessageHeaderUtils::getRawMessageId, msg -> msg))));
+				.thenApply(response -> createSendResultBatch(response, endpointName, originalMessagesById));
+	}
+
+	private <T> CompletableFuture<SendResult.Batch<T>> sendStandardBatches(String endpointName,
+			Collection<Message> messages, Map<String, org.springframework.messaging.Message<T>> originalMessagesById) {
+		List<CompletableFuture<SendResult.Batch<T>>> futures = CollectionUtils.partition(messages, 10).stream()
+				.map(partition -> sendSingleBatch(endpointName, partition, originalMessagesById)).toList();
+		return combineBatchFutures(futures);
+	}
+
+	private <T> CompletableFuture<SendResult.Batch<T>> sendFifoBatches(String endpointName,
+			Collection<Message> messages, Map<String, org.springframework.messaging.Message<T>> originalMessagesById) {
+		Map<String, List<Message>> groupedByMessageGroup = messages.stream().collect(Collectors.groupingBy(msg -> {
+			String groupId = msg.attributes().get(MessageSystemAttributeName.MESSAGE_GROUP_ID);
+			return groupId != null ? groupId : "";
+		}));
+		List<CompletableFuture<SendResult.Batch<T>>> groupFutures = groupedByMessageGroup.values().stream()
+				.map(groupMessages -> sendSequentialBatches(endpointName, groupMessages, originalMessagesById))
+				.toList();
+		return combineBatchFutures(groupFutures);
+	}
+
+	private <T> CompletableFuture<SendResult.Batch<T>> combineBatchFutures(
+			List<CompletableFuture<SendResult.Batch<T>>> futures) {
+		return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+				.thenApply(v -> futures.stream().map(CompletableFuture::join)
+						.reduce(new SendResult.Batch<>(List.of(), List.of()), this::mergeBatchResults));
+	}
+
+	private <T> CompletableFuture<SendResult.Batch<T>> sendSequentialBatches(String endpointName,
+			List<Message> messages, Map<String, org.springframework.messaging.Message<T>> originalMessagesById) {
+		CompletableFuture<SendResult.Batch<T>> result = CompletableFuture
+				.completedFuture(new SendResult.Batch<>(List.of(), List.of()));
+		for (Collection<Message> partition : CollectionUtils.partition(messages, 10)) {
+			result = result.thenCompose(acc -> sendSingleBatch(endpointName, partition, originalMessagesById)
+					.thenApply(batchResult -> mergeBatchResults(acc, batchResult)));
+		}
+		return result;
+	}
+
+	private <T> SendResult.Batch<T> mergeBatchResults(SendResult.Batch<T> batch1, SendResult.Batch<T> batch2) {
+		List<SendResult<T>> allSuccessful = new ArrayList<>(batch1.successful());
+		allSuccessful.addAll(batch2.successful());
+		List<SendResult.Failed<T>> allFailed = new ArrayList<>(batch1.failed());
+		allFailed.addAll(batch2.failed());
+		return new SendResult.Batch<>(allSuccessful, allFailed);
 	}
 
 	private <T> SendResult.Batch<T> createSendResultBatch(SendMessageBatchResponse response, String endpointName,
