@@ -124,6 +124,10 @@ class SqsFifoIntegrationTests extends BaseSqsIntegrationTest {
 
 	static final String FIFO_VISIBILITY_TIMEOUT_EXTENSION_QUEUE_NAME = "fifo_visibility_timeout_extension_test_queue.fifo";
 
+	static final String FIFO_SEND_MORE_THAN_10_MESSAGES_QUEUE_NAME = "fifo_send_more_than_10_messages.fifo";
+
+	static final String FIFO_SEND_MORE_THAN_10_MULTIPLE_GROUPS_QUEUE_NAME = "fifo_send_more_than_10_multiple_groups.fifo";
+
 	private static final String ERROR_ON_ACK_FACTORY = "errorOnAckFactory";
 	private static final String VISIBILITY_TIMEOUT_EXTENSION_FACTORY = "visibilityTimeoutExtensionFactory";
 
@@ -175,6 +179,8 @@ class SqsFifoIntegrationTests extends BaseSqsIntegrationTest {
 				createFifoQueue(client, FIFO_MANUALLY_CREATE_BATCH_CONTAINER_QUEUE_NAME),
 				createFifoQueue(client, OBSERVES_MESSAGE_FIFO_QUEUE_NAME),
 				createFifoQueue(client, FIFO_VISIBILITY_TIMEOUT_EXTENSION_QUEUE_NAME, getVisibilityAttribute("5")),
+				createFifoQueue(client, FIFO_SEND_MORE_THAN_10_MESSAGES_QUEUE_NAME),
+				createFifoQueue(client, FIFO_SEND_MORE_THAN_10_MULTIPLE_GROUPS_QUEUE_NAME),
 				createFifoQueue(client, FIFO_MANUALLY_CREATE_BATCH_FACTORY_QUEUE_NAME)).join();
 	}
 
@@ -537,64 +543,66 @@ class SqsFifoIntegrationTests extends BaseSqsIntegrationTest {
 	}
 
 	@Test
-	void sendsMoreThan10MessagesToFifoQueueInOrder() throws Exception {
+	void shouldSendBatchesInParallelAcrossMultipleMessageGroups() throws Exception {
+		List<String> valuesGroup1 = IntStream.range(0, 20).mapToObj(String::valueOf).collect(toList());
+		List<String> valuesGroup2 = IntStream.range(0, 15).mapToObj(String::valueOf).collect(toList());
+		String messageGroupId1 = UUID.randomUUID().toString();
+		String messageGroupId2 = UUID.randomUUID().toString();
+		List<Message<String>> messages = new ArrayList<>();
+		messages.addAll(createMessagesFromValues(messageGroupId1, valuesGroup1));
+		messages.addAll(createMessagesFromValues(messageGroupId2, valuesGroup2));
+		SqsAsyncClient spyClient = spy(createAsyncClient());
+		List<SendMessageBatchRequest> capturedRequests = Collections.synchronizedList(new ArrayList<>());
+		CountDownLatch secondCallArrived = new CountDownLatch(1);
+		CountDownLatch releaseCalls = new CountDownLatch(1);
+		AtomicInteger concurrentCalls = new AtomicInteger();
+		AtomicInteger maxConcurrent = new AtomicInteger();
+		doAnswer(invocation -> {
+			int current = concurrentCalls.incrementAndGet();
+			maxConcurrent.accumulateAndGet(current, Math::max);
+			capturedRequests.add(invocation.getArgument(0));
+			if (current == 2) {
+				secondCallArrived.countDown();
+			}
+			releaseCalls.await(10, TimeUnit.SECONDS);
+			try {
+				return invocation.callRealMethod();
+			}
+			finally {
+				concurrentCalls.decrementAndGet();
+			}
+		}).when(spyClient).sendMessageBatch(any(SendMessageBatchRequest.class));
+		SqsTemplate fifoTemplate = SqsTemplate.newTemplate(spyClient);
+		CompletableFuture<SendResult.Batch<String>> future = CompletableFuture
+				.supplyAsync(() -> fifoTemplate.sendMany(FIFO_SEND_MORE_THAN_10_MULTIPLE_GROUPS_QUEUE_NAME, messages));
+		assertThat(secondCallArrived.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(maxConcurrent.get()).isEqualTo(2);
+		releaseCalls.countDown();
+		SendResult.Batch<String> result = future.get(10, TimeUnit.SECONDS);
+		assertThat(result.successful()).hasSize(35);
+		assertThat(result.failed()).isEmpty();
+		assertThat(capturedRequests).hasSize(4);
+	}
+
+	@Test
+	void shouldSendBatchesSequentiallyWithinMessageGroup() throws Exception {
 		List<String> values = IntStream.range(0, 25).mapToObj(String::valueOf).collect(toList());
 		String messageGroupId = UUID.randomUUID().toString();
 		List<Message<String>> messages = createMessagesFromValues(messageGroupId, values);
 		SqsAsyncClient spyClient = spy(createAsyncClient());
 		List<SendMessageBatchRequest> capturedRequests = Collections.synchronizedList(new ArrayList<>());
-		AtomicInteger concurrentCalls = new AtomicInteger();
-		AtomicInteger maxConcurrent = new AtomicInteger();
 		doAnswer(invocation -> {
-			int current = concurrentCalls.incrementAndGet();
-			maxConcurrent.accumulateAndGet(current, Math::max);
 			capturedRequests.add(invocation.getArgument(0));
-			try {
-				return invocation.callRealMethod();
-			}
-			finally {
-				concurrentCalls.decrementAndGet();
-			}
+			return invocation.callRealMethod();
 		}).when(spyClient).sendMessageBatch(any(SendMessageBatchRequest.class));
 		SqsTemplate fifoTemplate = SqsTemplate.newTemplate(spyClient);
-		SendResult.Batch<String> result = fifoTemplate.sendMany(FIFO_RECEIVES_MESSAGES_IN_ORDER_QUEUE_NAME, messages);
+		SendResult.Batch<String> result = fifoTemplate.sendMany(FIFO_SEND_MORE_THAN_10_MESSAGES_QUEUE_NAME, messages);
 		assertThat(result.successful()).hasSize(25);
+		assertThat(result.failed()).isEmpty();
 		assertThat(capturedRequests).hasSize(3);
 		assertThat(capturedRequests.get(0).entries()).hasSize(10);
 		assertThat(capturedRequests.get(1).entries()).hasSize(10);
 		assertThat(capturedRequests.get(2).entries()).hasSize(5);
-		assertThat(maxConcurrent.get()).isEqualTo(1);
-	}
-
-	@Test
-	void sendsMoreThan10MessagesToFifoQueueMultipleGroupsInParallel() throws Exception {
-		List<String> values = IntStream.range(0, 15).mapToObj(String::valueOf).collect(toList());
-		String messageGroupId1 = UUID.randomUUID().toString();
-		String messageGroupId2 = UUID.randomUUID().toString();
-		List<Message<String>> messages = new ArrayList<>();
-		messages.addAll(createMessagesFromValues(messageGroupId1, values));
-		messages.addAll(createMessagesFromValues(messageGroupId2, values));
-		SqsAsyncClient spyClient = spy(createAsyncClient());
-		List<SendMessageBatchRequest> capturedRequests = Collections.synchronizedList(new ArrayList<>());
-		AtomicInteger concurrentCalls = new AtomicInteger();
-		AtomicInteger maxConcurrent = new AtomicInteger();
-		doAnswer(invocation -> {
-			int current = concurrentCalls.incrementAndGet();
-			maxConcurrent.accumulateAndGet(current, Math::max);
-			capturedRequests.add(invocation.getArgument(0));
-			try {
-				return invocation.callRealMethod();
-			}
-			finally {
-				concurrentCalls.decrementAndGet();
-			}
-		}).when(spyClient).sendMessageBatch(any(SendMessageBatchRequest.class));
-		SqsTemplate fifoTemplate = SqsTemplate.newTemplate(spyClient);
-		SendResult.Batch<String> result = fifoTemplate.sendMany(FIFO_RECEIVES_MESSAGE_IN_ORDER_MANY_GROUPS_QUEUE_NAME,
-				messages);
-		assertThat(result.successful()).hasSize(30);
-		assertThat(capturedRequests).hasSize(4);
-		assertThat(maxConcurrent.get()).isLessThanOrEqualTo(2);
 	}
 
 	private Message<String> createMessage(String body, String messageGroupId) {
