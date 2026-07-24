@@ -370,6 +370,14 @@ public class SqsTemplate extends AbstractMessagingTemplate<Message> implements S
 				.messageSystemAttributes(mapMessageSystemAttributes(message)).build();
 	}
 
+	/**
+	 * Sends a batch of messages in a single SQS batch request. The collection may have more than 10 messages &mdash;
+	 * the template automatically partitions it into batches of 10: for standard queues batches are sent in parallel,
+	 * for FIFO queues messages are grouped by
+	 * {@link io.awspring.cloud.sqs.listener.SqsHeaders.MessageSystemAttributes#SQS_MESSAGE_GROUP_ID_HEADER message
+	 * group ID} and each group's batches are sent sequentially. If a FIFO batch returns a partial failure, subsequent
+	 * batches for that group are skipped to preserve ordering within the message group.
+	 */
 	@Override
 	protected <T> CompletableFuture<SendResult.Batch<T>> doSendBatchAsync(String endpointName,
 			Collection<Message> messages, Collection<org.springframework.messaging.Message<T>> originalMessages) {
@@ -422,8 +430,13 @@ public class SqsTemplate extends AbstractMessagingTemplate<Message> implements S
 		CompletableFuture<SendResult.Batch<T>> result = CompletableFuture
 				.completedFuture(new SendResult.Batch<>(List.of(), List.of()));
 		for (Collection<Message> partition : CollectionUtils.partition(messages, 10)) {
-			result = result.thenCompose(acc -> sendSingleBatch(endpointName, partition, originalMessagesById)
-					.thenApply(batchResult -> mergeBatchResults(acc, batchResult)));
+			result = result.thenCompose(acc -> {
+				if (!acc.failed().isEmpty()) {
+					return CompletableFuture.completedFuture(acc);
+				}
+				return sendSingleBatch(endpointName, partition, originalMessagesById)
+						.thenApply(batchResult -> mergeBatchResults(acc, batchResult));
+			});
 		}
 		return result;
 	}
